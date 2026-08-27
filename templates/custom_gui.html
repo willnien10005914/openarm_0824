@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DaMiao 6248P 位置控制</title>
+  <style>
+    :root {
+      --bg: #12151c;
+      --panel: #1b2030;
+      --line: #2c3448;
+      --text: #e8edf7;
+      --muted: #93a0b8;
+      --current: #5ee0c8;
+      --target: #f3b14e;
+      --danger: #ef6b6b;
+      --ok: #6fbf73;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Microsoft JhengHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+    }
+    h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    .sub { color: var(--muted); font-size: 13px; }
+    main {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      gap: 20px;
+      padding: 20px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 16px;
+    }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    input, select {
+      width: 100%;
+      background: #10141e;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 12px;
+    }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 9px 14px;
+      cursor: pointer;
+      font-weight: 600;
+      color: inherit;
+      user-select: none;
+      box-shadow: 0 2px 0 rgba(0,0,0,0.35);
+      transition: transform 0.08s ease, filter 0.08s ease, box-shadow 0.08s ease, opacity 0.12s ease;
+    }
+    button:hover:not(:disabled) { filter: brightness(1.12); }
+    button:active:not(:disabled), button.is-down:not(:disabled) {
+      transform: translateY(2px) scale(0.96);
+      box-shadow: 0 0 0 rgba(0,0,0,0.35);
+      filter: brightness(0.86);
+    }
+    button:focus-visible { outline: 2px solid #8cb4ff; outline-offset: 2px; }
+    button:disabled { opacity: 0.55; cursor: wait; transform: none; }
+    button.busy { opacity: 0.7; }
+    button.selected {
+      box-shadow: 0 0 0 2px #f3b14e, 0 2px 0 rgba(0,0,0,0.35);
+    }
+    .primary { background: #3d7dff; color: white; }
+    button.ok { background: var(--ok); color: #08210c; }
+    .warn { background: var(--target); color: #2a1a00; }
+    .danger { background: var(--danger); color: white; }
+    .ghost { background: #2a3144; color: var(--text); }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .stat {
+      background: #10141e;
+      border-radius: 10px;
+      padding: 10px;
+    }
+    .stat b { display: block; font-size: 18px; margin-top: 4px; }
+    .dial-wrap { display: flex; flex-direction: column; align-items: center; }
+    svg { max-width: 100%; touch-action: none; cursor: crosshair; }
+    svg.is-down { filter: brightness(1.15); }
+    .hint { color: var(--muted); font-size: 13px; text-align: center; margin-top: 8px; }
+    .legend { display: flex; gap: 16px; justify-content: center; margin-top: 8px; font-size: 13px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+    .log {
+      min-height: 92px;
+      max-height: 180px;
+      overflow: auto;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: pre-wrap;
+      background: #10141e;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-top: 10px;
+      font-family: Consolas, "Courier New", monospace;
+    }
+    .log .err { color: var(--danger); }
+    .log .ok { color: var(--ok); background: transparent; font-weight: 400; padding: 0; }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>DM-J6248P 位置圓盤</h1>
+      <div class="sub">Zubax Babel (slcan) / USB-CAN-A · Windows 非 socketcan</div>
+    </div>
+    <div class="sub" id="connLabel">未連線</div>
+  </header>
+  <main>
+    <section class="card">
+      <label>轉接器</label>
+      <select id="adapter">
+        <option value="auto">自動偵測</option>
+        <option value="slcan">Zubax Babel (slcan)</option>
+        <option value="usbcan_a">Waveshare USB-CAN-A</option>
+      </select>
+      <label>COM 埠</label>
+      <select id="port"></select>
+      <div class="row">
+        <button class="primary" id="btnConnect">連線並掃描</button>
+        <button class="ghost" id="btnDisconnect">斷線</button>
+      </div>
+      <label>馬達 Node ID</label>
+      <select id="motor"></select>
+      <div class="row">
+        <button class="ok" id="btnEnable">Enable</button>
+        <button class="danger" id="btnDisable">Disable</button>
+      </div>
+      <div style="margin-top: 16px; margin-bottom: 16px; padding: 12px; background: #23293b; border: 1px solid #3d4a66; border-radius: 8px;">
+        <label style="color: #f3b14e; font-weight: bold; margin-bottom: 8px; display: block;">ID 燒錄與測試 (Flash & Test)</label>
+        <label>選擇 Joint</label>
+        <select id="flashJoint">
+          <option value="">-- 自訂輸入 / 請選擇關節 --</option>
+          <option value="J1" data-sender="1" data-receiver="17">J1 (Sender: 0x01, Master: 0x11)</option>
+          <option value="J2" data-sender="2" data-receiver="18">J2 (Sender: 0x02, Master: 0x12)</option>
+          <option value="J3" data-sender="3" data-receiver="19">J3 (Sender: 0x03, Master: 0x13)</option>
+          <option value="J4" data-sender="4" data-receiver="20">J4 (Sender: 0x04, Master: 0x14)</option>
+          <option value="J5" data-sender="5" data-receiver="21">J5 (Sender: 0x05, Master: 0x15)</option>
+          <option value="J6" data-sender="6" data-receiver="22">J6 (Sender: 0x06, Master: 0x16)</option>
+          <option value="J7" data-sender="7" data-receiver="23">J7 (Sender: 0x07, Master: 0x17)</option>
+          <option value="J8" data-sender="8" data-receiver="24">J8 (Gripper) (Sender: 0x08, Master: 0x18)</option>
+        </select>
+        <div class="row" style="margin-bottom: 8px">
+            <div style="flex:1">
+                <label>Sender CAN ID</label>
+                <input type="number" id="flashSender" placeholder="例如 1" />
+            </div>
+            <div style="flex:1">
+                <label>Receiver ID</label>
+                <input type="number" id="flashReceiver" placeholder="例如 17" />
+            </div>
+        </div>
+        <button class="warn" id="btnFlash" style="width: 100%">寫入 ID</button>
+      </div>
+      <div class="stats">
+        <div class="stat">目前角度<b id="curDeg">--</b></div>
+        <div class="stat">目前位置<b id="curRad">-- rad</b></div>
+        <div class="stat">目標角度<b id="tgtDeg">--</b></div>
+        <div class="stat">狀態<b id="status">--</b></div>
+        <div class="stat">速度<b id="vel">--</b></div>
+        <div class="stat">扭矩 / 溫度<b id="misc">--</b></div>
+      </div>
+      <label>最快速率（度/秒，預設很慢）</label>
+      <input id="speed" type="range" min="3" max="60" value="18" />
+      <div class="sub" id="speedLabel">18 °/s</div>
+      <label>MIT Kp / Kd</label>
+      <div class="row">
+        <input id="kp" type="number" step="0.5" value="8" />
+        <input id="kd" type="number" step="0.1" value="1.0" />
+      </div>
+      <div class="log" id="log">選轉接器與 COM 埠後按連線。Enable 後在右側圓盤點選目標角度。</div>
+    </section>
+    <section class="card dial-wrap">
+      <svg id="dial" viewBox="0 0 420 420" width="420" height="420">
+        <circle cx="210" cy="210" r="168" fill="#10141e" stroke="#2c3448" stroke-width="10" />
+        <circle cx="210" cy="210" r="18" fill="#3a4258" />
+        <g id="ticks"></g>
+        <polygon id="targetNeedle" points="210,48 201,92 219,92" fill="#f3b14e" />
+        <polygon id="currentNeedle" points="210,46 198,118 222,118" fill="#5ee0c8" />
+        <text x="210" y="228" text-anchor="middle" fill="#e8edf7" font-size="28" font-weight="700" id="centerDeg">--°</text>
+        <text x="210" y="252" text-anchor="middle" fill="#93a0b8" font-size="13" id="centerHint">點圓盤選角度</text>
+      </svg>
+      <div class="legend">
+        <span><i class="dot" style="background:#5ee0c8"></i>目前位置</span>
+        <span><i class="dot" style="background:#f3b14e"></i>滑鼠目標</span>
+      </div>
+      <div class="hint">0° 在正上方，順時針增加。點選後走最短路徑，不會一次轉整圈。</div>
+      <div class="row" style="margin-top:12px">
+        <button class="ghost" data-deg="0">0°</button>
+        <button class="ghost" data-deg="90">90°</button>
+        <button class="ghost" data-deg="180">180°</button>
+        <button class="ghost" data-deg="270">270°</button>
+      </div>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const ticks = $("ticks");
+    for (let i = 0; i < 36; i++) {
+      const a = (i * 10 - 90) * Math.PI / 180;
+      const inner = i % 9 === 0 ? 128 : 148;
+      const x1 = 210 + Math.cos(a) * inner;
+      const y1 = 210 + Math.sin(a) * inner;
+      const x2 = 210 + Math.cos(a) * 168;
+      const y2 = 210 + Math.sin(a) * 168;
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      line.setAttribute("x1", x1); line.setAttribute("y1", y1);
+      line.setAttribute("x2", x2); line.setAttribute("y2", y2);
+      line.setAttribute("stroke", i % 9 === 0 ? "#c9d4ea" : "#3a4258");
+      line.setAttribute("stroke-width", i % 9 === 0 ? 3 : 1.5);
+      ticks.appendChild(line);
+    }
+    ["0°","90°","180°","270°"].forEach((label, i) => {
+      const a = (i * 90 - 90) * Math.PI / 180;
+      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      text.setAttribute("x", 210 + Math.cos(a) * 188);
+      text.setAttribute("y", 210 + Math.sin(a) * 188 + 4);
+      text.setAttribute("text-anchor", "middle");
+      text.setAttribute("fill", "#93a0b8");
+      text.setAttribute("font-size", "13");
+      text.textContent = label;
+      ticks.appendChild(text);
+    });
+
+    function rotateNeedle(id, deg) {
+      $(id).setAttribute("transform", `rotate(${deg} 210 210)`);
+    }
+
+    const lines = [];
+    let lastErrorSeq = 0;
+    let lastMotorsKey = "";
+    let pollFails = 0;
+    let enabled = false;
+
+    async function api(path, opts) {
+      let res;
+      try {
+        res = await fetch(path, opts);
+      } catch (e) {
+        throw new Error("後端沒回應（程式可能已中斷）：" + (e.message || e));
+      }
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        throw new Error("後端回傳不是 JSON（HTTP " + res.status + "），程式可能已中斷。");
+      }
+      if (!data.success) throw new Error(data.error || "request failed");
+      return data;
+    }
+
+    function log(msg, kind) {
+      const t = new Date().toLocaleTimeString();
+      lines.push({ t, msg: String(msg), kind: kind || "" });
+      if (lines.length > 40) lines.shift();
+      $("log").innerHTML = lines.map(item => {
+        const cls = item.kind === "err" ? "err" : (item.kind === "ok" ? "ok" : "");
+        return `<div class="${cls}">[${item.t}] ${item.msg}</div>`;
+      }).join("");
+      $("log").scrollTop = $("log").scrollHeight;
+    }
+
+    function ingestErrors(s) {
+      const errs = s.errors || [];
+      for (const item of errs) {
+        if (item.seq > lastErrorSeq) {
+          lastErrorSeq = item.seq;
+          log(item.msg, "err");
+        }
+      }
+    }
+
+    function applyState(s) {
+      enabled = !!s.enabled;
+      $("connLabel").textContent = s.connected
+        ? `已連線 ${s.channel} (${s.adapter || "slcan"}) · Node 0x${Number(s.motor_id).toString(16).toUpperCase()} · ${s.enabled ? "Enable" : "Disable"}`
+        : "未連線";
+      $("status").textContent = s.status || "--";
+      $("curDeg").textContent = s.pos_deg_mod == null ? "--" : s.pos_deg_mod.toFixed(1) + "°";
+      $("curRad").textContent = s.pos_rad == null ? "--" : s.pos_rad.toFixed(4) + " rad";
+      $("tgtDeg").textContent = s.target_deg_mod == null ? "--" : s.target_deg_mod.toFixed(1) + "°";
+      $("vel").textContent = s.vel == null ? "--" : (s.vel * 180 / Math.PI).toFixed(1) + " °/s";
+      $("misc").textContent = `${(s.torq ?? 0).toFixed(2)} Nm / ${s.t_mos ?? "--"}°C`;
+      $("centerDeg").textContent = s.pos_deg_mod == null ? "--°" : s.pos_deg_mod.toFixed(1) + "°";
+      $("centerHint").textContent = s.enabled ? "點圓盤選角度" : "先按 Enable 才會轉動";
+      if (s.pos_deg_mod != null) rotateNeedle("currentNeedle", s.pos_deg_mod);
+      if (s.target_deg_mod != null) rotateNeedle("targetNeedle", s.target_deg_mod);
+      const key = (s.motors || []).map(m => m.id).join(",");
+      if (s.motors && key !== lastMotorsKey) {
+        lastMotorsKey = key;
+        const sel = $("motor");
+        sel.innerHTML = s.motors.map(m =>
+          `<option value="${m.id}">0x${m.id.toString(16).toUpperCase().padStart(2,"0")} · ${m.status || ""}</option>`
+        ).join("");
+        if (s.motor_id != null) sel.value = String(s.motor_id);
+      }
+      ingestErrors(s);
+    }
+
+    async function refreshPorts() {
+      const data = await api("/api/ports");
+      const ports = data.ports || [];
+      $("port").innerHTML = ports.map(p => {
+        if (typeof p === "string") return `<option value="${p}">${p}</option>`;
+        return `<option value="${p.device}" data-kind="${p.kind}">${p.label}</option>`;
+      }).join("") || `<option value="">(沒有 COM)</option>`;
+      if (ports.some(p => (p.kind || "") === "slcan")) {
+        $("adapter").value = "auto";
+      }
+    }
+
+    async function poll() {
+      try {
+        const data = await api("/api/state");
+        pollFails = 0;
+        applyState(data.state);
+      } catch (e) {
+        pollFails += 1;
+        if (pollFails === 2 || pollFails === 8) log("輪詢失敗：" + e.message, "err");
+      }
+    }
+
+    function markPreset(deg) {
+      document.querySelectorAll("button[data-deg]").forEach(btn => {
+        btn.classList.toggle("selected", Number(btn.dataset.deg) === Math.round(deg));
+      });
+    }
+
+    async function withBusy(btn, fn) {
+      if (!btn) return fn();
+      btn.classList.add("busy", "is-down");
+      btn.disabled = true;
+      try {
+        return await fn();
+      } finally {
+        btn.classList.remove("busy", "is-down");
+        btn.disabled = false;
+      }
+    }
+
+    async function setTargetDeg(deg, btn) {
+      rotateNeedle("targetNeedle", deg);
+      $("tgtDeg").textContent = deg.toFixed(1) + "°";
+      markPreset(deg);
+      await withBusy(btn, async () => {
+        const data = await api("/api/target", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ deg })
+        });
+        applyState(data.state);
+        if (data.warning) log(data.warning);
+        else log(`目標 ${deg.toFixed(1)}°，沿最短路徑慢速移動。`, "ok");
+      });
+    }
+
+    $("dial").addEventListener("pointerdown", (ev) => {
+      const rect = $("dial").getBoundingClientRect();
+      const x = (ev.clientX - rect.left) / rect.width * 420;
+      const y = (ev.clientY - rect.top) / rect.height * 420;
+      const dx = x - 210, dy = y - 210;
+      if (Math.hypot(dx, dy) < 40) return;
+      let deg = Math.atan2(dx, -dy) * 180 / Math.PI;
+      if (deg < 0) deg += 360;
+      $("dial").classList.add("is-down");
+      setTargetDeg(deg).catch(err => log(err.message, "err"));
+    });
+    $("dial").addEventListener("pointerup", () => $("dial").classList.remove("is-down"));
+    $("dial").addEventListener("pointerleave", () => $("dial").classList.remove("is-down"));
+
+    document.querySelectorAll("button").forEach(btn => {
+      btn.addEventListener("pointerdown", () => btn.classList.add("is-down"));
+      ["pointerup", "pointerleave", "pointercancel"].forEach(ev => {
+        btn.addEventListener(ev, () => btn.classList.remove("is-down"));
+      });
+    });
+
+    document.querySelectorAll("button[data-deg]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        setTargetDeg(Number(btn.dataset.deg), btn).catch(err => log(err.message, "err"));
+      });
+    });
+
+    $("btnConnect").onclick = () => withBusy($("btnConnect"), async () => {
+      log("連線中（Babel 約需 1 秒初始化）...");
+      const data = await api("/api/connect", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ channel: $("port").value, adapter: $("adapter").value })
+      });
+      applyState(data.state);
+      log("已連線並掃到馬達。請先 Enable，再點圓盤選位置。", "ok");
+    }).catch(e => log(e.message, "err"));
+
+    $("btnDisconnect").onclick = () => withBusy($("btnDisconnect"), async () => {
+      await api("/api/disconnect", { method: "POST" });
+      lastMotorsKey = "";
+      log("已斷線", "ok");
+      poll();
+    }).catch(e => log(e.message, "err"));
+
+    $("btnEnable").onclick = () => withBusy($("btnEnable"), async () => {
+      const data = await api("/api/enable", { method: "POST" });
+      applyState(data.state);
+      log("已 Enable。現在可以點圓盤，馬達會慢慢轉到該角度。", "ok");
+    }).catch(e => log(e.message, "err"));
+
+    $("btnDisable").onclick = () => withBusy($("btnDisable"), async () => {
+      const data = await api("/api/disable", { method: "POST" });
+      applyState(data.state);
+      log("已 Disable。", "ok");
+    }).catch(e => log(e.message, "err"));
+
+    $("flashJoint").onchange = () => {
+      const opt = $("flashJoint").options[$("flashJoint").selectedIndex];
+      if (opt.value) {
+        $("flashSender").value = opt.dataset.sender;
+        $("flashReceiver").value = opt.dataset.receiver;
+      }
+    };
+
+    $("btnFlash").onclick = () => withBusy($("btnFlash"), async () => {
+      const sender = parseInt($("flashSender").value);
+      const receiver = parseInt($("flashReceiver").value);
+      const jointName = $("flashJoint").value || "自訂";
+      
+      if (!sender || !receiver || sender < 1 || sender > 15 || receiver < 1) {
+        alert("請輸入有效的 ID 數字 (Sender 通常為 1~15)");
+        return;
+      }
+      
+      if (!confirm(`即將對馬達 (${jointName}) 燒錄 Sender CAN ID 為 0x${sender.toString(16).toUpperCase()}，Receiver ID 為 0x${receiver.toString(16).toUpperCase()}。確認嗎？`)) {
+        return;
+      }
+      
+      log(`[等待] 正在燒錄 ${jointName} 的 ID，這大約需要兩秒鐘...`);
+      const data = await api("/api/flash_id", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ 
+          joint_name: jointName,
+          sender_can_id: sender,
+          receiver_master_id: receiver
+        })
+      });
+      applyState(data.state);
+      if (data.message) {
+        log(data.message, "ok");
+      }
+    }).catch(e => log(e.message, "err"));
+
+
+    $("motor").onchange = async () => {
+      try {
+        const data = await api("/api/select", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ id: Number($("motor").value) })
+        });
+        applyState(data.state);
+        log("已切換馬達。切換後需再按 Enable。");
+      } catch (e) { log(e.message, "err"); }
+    };
+    async function pushSettings() {
+      $("speedLabel").textContent = $("speed").value + " °/s";
+      try {
+        await api("/api/settings", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            max_deg_s: Number($("speed").value),
+            kp: Number($("kp").value),
+            kd: Number($("kd").value),
+          })
+        });
+      } catch (e) { log("設定失敗：" + e.message, "err"); }
+    }
+    $("speed").oninput = pushSettings;
+    $("kp").onchange = pushSettings;
+    $("kd").onchange = pushSettings;
+
+    refreshPorts().catch(err => log(err.message, "err"));
+    log("選轉接器與 COM 埠後按連線。Enable 後在右側圓盤點選目標角度。");
+    setInterval(poll, 200);
+  </script>
+</body>
+</html>
