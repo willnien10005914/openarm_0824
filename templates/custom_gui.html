@@ -136,6 +136,8 @@
     .motor-item:hover { background: #1a2130; }
     .motor-item.focused { border-color: #f3b14e; background: #241c0c; }
     .motor-item.enabled { box-shadow: inset 3px 0 0 var(--ok); }
+    .motor-item.spinning { box-shadow: inset 3px 0 0 var(--target); }
+    .motor-item.enabled.spinning { box-shadow: inset 3px 0 0 var(--target); }
     .motor-item input { width: auto; margin: 0; }
     .motor-item .meta { flex: 1; font-size: 13px; }
     .motor-item .ang { color: var(--current); font-variant-numeric: tabular-nums; font-size: 13px; }
@@ -173,6 +175,19 @@
       <div class="row">
         <button class="ok" id="btnEnable">Enable 選取</button>
         <button class="danger" id="btnDisable">Disable 選取</button>
+      </div>
+      <div style="margin-top: 16px; margin-bottom: 16px; padding: 12px; background: #23293b; border: 1px solid #3d4a66; border-radius: 8px;">
+        <label style="color: #f3b14e; font-weight: bold; margin-bottom: 8px; display: block;">壓測：持續轉圈</label>
+        <label>方向</label>
+        <select id="spinDir">
+          <option value="1">順時針（角度增加）</option>
+          <option value="-1">逆時針（角度減少）</option>
+        </select>
+        <div class="row">
+          <button class="warn" id="btnSpinStart">開始轉圈</button>
+          <button class="ghost" id="btnSpinStop">停止轉圈</button>
+        </div>
+        <div class="sub">對<strong>所有已 Enable</strong> 的馬達一起轉，不限目前勾選。速率用上面的「最快速率」。點圓盤、Disable 或按停止會鎖在當下角度。</div>
       </div>
       <div style="margin-top: 16px; margin-bottom: 16px; padding: 12px; background: #23293b; border: 1px solid #3d4a66; border-radius: 8px;">
         <label style="color: #f3b14e; font-weight: bold; margin-bottom: 8px; display: block;">ID 燒錄與測試 (Flash & Test)</label>
@@ -232,7 +247,7 @@
         <span><i class="dot" style="background:#5ee0c8"></i>目前位置</span>
         <span><i class="dot" style="background:#f3b14e"></i>滑鼠目標</span>
       </div>
-      <div class="hint">0° 在正上方，順時針增加。點選後，<b>勾選的馬達</b>各自走最短路徑轉到該角度。</div>
+      <div class="hint">0° 在正上方，順時針增加。點選後，<b>勾選的馬達</b>各自走最短路徑轉到該角度。轉圈壓測中點圓盤會先停止再轉到該角。</div>
       <div class="row" style="margin-top:12px">
         <button class="ghost" data-deg="0">0°</button>
         <button class="ghost" data-deg="90">90°</button>
@@ -317,10 +332,12 @@
             const checked = m.selected ? "checked" : "";
             const en = m.enabled ? "enabled" : "";
             const fo = m.focused ? "focused" : "";
+            const sp = m.spinning ? "spinning" : "";
             const ang = m.pos_deg_mod == null ? "--" : m.pos_deg_mod.toFixed(1) + "°";
-            return `<label class="motor-item ${en} ${fo}" data-id="${m.id}">
+            const tag = m.spinning ? "轉圈" : (m.enabled ? "Enable" : "");
+            return `<label class="motor-item ${en} ${fo} ${sp}" data-id="${m.id}">
               <input type="checkbox" value="${m.id}" ${checked} />
-              <span class="meta">${hexId(m.id)}${mst} · ${m.status || ""} ${m.enabled ? "Enable" : ""}</span>
+              <span class="meta">${hexId(m.id)}${mst} · ${m.status || ""} ${tag}</span>
               <span class="ang" data-ang="${m.id}">${ang}</span>
             </label>`;
           }).join("");
@@ -345,6 +362,7 @@
           if (!row) return;
           row.classList.toggle("focused", !!m.focused);
           row.classList.toggle("enabled", !!m.enabled);
+          row.classList.toggle("spinning", !!m.spinning);
           const box = row.querySelector("input");
           if (box && box.checked !== !!m.selected) box.checked = !!m.selected;
           const ang = row.querySelector(".ang");
@@ -352,7 +370,8 @@
           const meta = row.querySelector(".meta");
           if (meta) {
             const mst = m.mst_id != null ? ` MST ${hexId(m.mst_id)}` : "";
-            meta.textContent = `${hexId(m.id)}${mst} · ${m.status || ""} ${m.enabled ? "Enable" : ""}`;
+            const tag = m.spinning ? "轉圈" : (m.enabled ? "Enable" : "");
+            meta.textContent = `${hexId(m.id)}${mst} · ${m.status || ""} ${tag}`;
           }
         });
       }
@@ -411,9 +430,21 @@
       $("vel").textContent = s.vel == null ? "--" : (s.vel * 180 / Math.PI).toFixed(1) + " °/s";
       $("misc").textContent = `${(s.torq ?? 0).toFixed(2)} Nm / ${s.t_mos ?? "--"}°C`;
       $("centerDeg").textContent = s.pos_deg_mod == null ? "--°" : s.pos_deg_mod.toFixed(1) + "°";
-      $("centerHint").textContent = nEn
-        ? `點圓盤：${nSel || nEn} 顆一起轉到該角度`
-        : "勾選馬達後按 Enable，再點圓盤";
+      const spinning = !!s.spinning;
+      $("btnSpinStart").classList.toggle("selected", spinning);
+      if ($("spinDir") && document.activeElement !== $("spinDir") && (s.spin_dir === 1 || s.spin_dir === -1)) {
+        $("spinDir").value = String(s.spin_dir);
+      }
+      if (spinning) {
+        $("centerHint").textContent = s.spin_dir < 0 ? "壓測轉圈中（逆時針）" : "壓測轉圈中（順時針）";
+        $("connLabel").textContent = s.connected
+          ? `已連線 ${s.channel} (${s.adapter || "slcan"}) · 選 ${nSel} 顆 · Enable ${nEn} · 轉圈 ${(s.spinning_ids || []).length}`
+          : "未連線";
+      } else {
+        $("centerHint").textContent = nEn
+          ? `點圓盤：${nSel || nEn} 顆一起轉到該角度`
+          : "勾選馬達後按 Enable，再點圓盤";
+      }
       if (s.pos_deg_mod != null) rotateNeedle("currentNeedle", s.pos_deg_mod);
       if (s.target_deg_mod != null) rotateNeedle("targetNeedle", s.target_deg_mod);
       renderMotorList(s);
@@ -475,7 +506,7 @@
         if (data.warning) log(data.warning);
         else {
           const n = currentSelected().length || 1;
-          log(`目標 ${deg.toFixed(1)}°，${n} 顆馬達各自沿最短路徑慢速移動。`, "ok");
+          log(`目標 ${deg.toFixed(1)}°，${n} 顆馬達各自沿最短路徑慢速移動（轉圈壓測已停止）。`, "ok");
         }
       });
     }
@@ -565,6 +596,34 @@
       log(`已 Disable ${ids.length || "選取"} 顆。`, "ok");
     }).catch(e => log(e.message, "err"));
 
+    async function pushSpin(enable) {
+      const data = await api("/api/spin", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          enable,
+          dir: Number($("spinDir").value),
+        })
+      });
+      applyState(data.state);
+      if (data.message) log(data.message, "ok");
+      return data;
+    }
+
+    $("btnSpinStart").onclick = () => withBusy($("btnSpinStart"), async () => {
+      await pushSpin(true);
+    }).catch(e => log(e.message, "err"));
+
+    $("btnSpinStop").onclick = () => withBusy($("btnSpinStop"), async () => {
+      await pushSpin(false);
+    }).catch(e => log(e.message, "err"));
+
+    $("spinDir").onchange = () => {
+      if ($("btnSpinStart").classList.contains("selected")) {
+        pushSpin(true).catch(e => log(e.message, "err"));
+      }
+    };
+
     $("btnSelectAll").onclick = () => {
       const ids = Array.from(document.querySelectorAll("#motorList input[type=checkbox]")).map(el => Number(el.value));
       pushSelection(ids).catch(e => log(e.message, "err"));
@@ -631,7 +690,7 @@
     $("kd").onchange = pushSettings;
 
     refreshPorts().catch(err => log(err.message, "err"));
-    log("選轉接器與 COM 埠後按連線。勾選多顆可一起 Enable，再點圓盤一起轉到同一角度。");
+    log("選轉接器與 COM 埠後按連線。勾選多顆可一起 Enable，再點圓盤一起轉到同一角度，或按「開始轉圈」做持續旋轉壓測。");
     setInterval(poll, 200);
   </script>
 </body>

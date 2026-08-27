@@ -22,6 +22,8 @@ MAX_SPEED_DEG_S = 60.0
 DEFAULT_SPEED_DEG_S = 18.0
 DEFAULT_KP = 4.0
 DEFAULT_KD = 2.0
+# 6248P MIT 位置編碼約 ±12.566 rad，轉圈壓測改走速度模式，避免角度累加爆限。
+SPIN_POS_CLAMP = 12.0
 SCAN_ID_MIN = 0x01
 SCAN_ID_MAX = 0x10
 ESC_ID_RID = 8
@@ -106,6 +108,7 @@ def _reset_tracks(
             "enabled": False,
             "cmd_pos": pos if pos is not None else prev.get("cmd_pos"),
             "target_pos": pos if pos is not None else prev.get("target_pos"),
+            "spin_dir": 0,
             "fail": 0,
         }
     if keep_selected:
@@ -153,15 +156,18 @@ def _motors_payload() -> list[dict[str, Any]]:
         pos = state.get("pos")
         if pos is None:
             pos = tr.get("cmd_pos")
+        disp = tr.get("spin_disp") if tr.get("spin_dir") else None
+        show_pos = disp if disp is not None else pos
         tgt = tr.get("target_pos")
         item = dict(info)
         item.update(
             {
                 "selected": mid in _selected_ids,
                 "enabled": bool(tr.get("enabled")),
+                "spinning": bool(tr.get("spin_dir")),
                 "focused": mid == _focus_id,
                 "pos": pos,
-                "pos_deg_mod": _deg_mod(None if pos is None else float(pos)),
+                "pos_deg_mod": _deg_mod(None if show_pos is None else float(show_pos)),
                 "target_rad": tgt,
                 "target_deg_mod": _deg_mod(None if tgt is None else float(tgt)),
                 "status": state.get("status") or info.get("status"),
@@ -184,6 +190,17 @@ def _state_payload() -> dict[str, Any]:
     vel = raw.get("vel")
     motors = _motors_payload()
     enabled_ids = [mid for mid, tr in _tracks.items() if tr.get("enabled")]
+    spinning_ids = [mid for mid, tr in _tracks.items() if tr.get("spin_dir")]
+    spin_dir = 0
+    if _focus_id in _tracks:
+        spin_dir = int(_tracks[_focus_id].get("spin_dir") or 0)
+    if not spin_dir and spinning_ids:
+        spin_dir = int(_tracks[spinning_ids[0]].get("spin_dir") or 0)
+    show_pos = pos
+    if _focus_id in _tracks and _tracks[_focus_id].get("spin_dir"):
+        disp = _tracks[_focus_id].get("spin_disp")
+        if disp is not None:
+            show_pos = disp
     return {
         "connected": _controller is not None,
         "channel": _channel,
@@ -192,11 +209,14 @@ def _state_payload() -> dict[str, Any]:
         "motor_id": _focus_id,
         "selected_ids": list(_selected_ids),
         "enabled_ids": enabled_ids,
+        "spinning": bool(spinning_ids),
+        "spinning_ids": spinning_ids,
+        "spin_dir": spin_dir if spin_dir else 1,
         "motors": motors,
         "status": raw.get("status"),
         "pos_rad": pos,
         "pos_deg": None if pos is None else math.degrees(pos),
-        "pos_deg_mod": _deg_mod(None if pos is None else float(pos)),
+        "pos_deg_mod": _deg_mod(None if show_pos is None else float(show_pos)),
         "vel": vel,
         "torq": raw.get("torq"),
         "t_mos": raw.get("t_mos"),
@@ -305,6 +325,18 @@ def _read_register_fresh(motor, rid: int, timeout: float = 0.7) -> Optional[int]
         return None
 
 
+def _clamp_mit_pos(pos: float) -> float:
+    return max(-SPIN_POS_CLAMP, min(SPIN_POS_CLAMP, float(pos)))
+
+
+def _clear_spin_locked(ids: Optional[list[int]] = None) -> None:
+    targets = ids if ids is not None else list(_tracks)
+    for mid in targets:
+        if mid in _tracks:
+            _tracks[mid]["spin_dir"] = 0
+            _tracks[mid]["spin_disp"] = None
+
+
 def _control_loop() -> None:
     global _send_fail
     dt = 1.0 / CMD_HZ
@@ -321,26 +353,56 @@ def _control_loop() -> None:
                     continue
                 cmd = tr.get("cmd_pos")
                 target = tr.get("target_pos")
-                if cmd is None or target is None or controller is None:
+                spin_dir = int(tr.get("spin_dir") or 0)
+                if controller is None:
                     continue
-                jobs.append((mid, cmd, target))
-        if jobs and controller is not None:
-            for mid, cmd, target in jobs:
-                err = target - cmd
-                step = max_speed * dt
-                if abs(err) <= step:
-                    cmd = target
-                    vel_ff = 0.0
+                if spin_dir:
+                    jobs.append((mid, cmd, target, spin_dir, tr.get("spin_disp")))
+                elif cmd is None or target is None:
+                    continue
                 else:
-                    cmd += math.copysign(step, err)
-                    vel_ff = math.copysign(max_speed, err)
+                    jobs.append((mid, cmd, target, 0, None))
+        if jobs and controller is not None:
+            for i, (mid, cmd, target, spin_dir, spin_disp) in enumerate(jobs):
                 try:
                     motor = controller.get_motor(mid)
-                    _send_mit(motor, cmd, vel_ff, kp, kd)
-                    with _lock:
-                        if mid in _tracks:
-                            _tracks[mid]["cmd_pos"] = cmd
-                            _tracks[mid]["fail"] = 0
+                    if spin_dir:
+                        # Same MIT position+vel path as the dial. kp=0 velocity
+                        # mode often only moves the free joint on a multi-motor bus.
+                        if cmd is None:
+                            cmd = 0.0
+                        step = max_speed * dt
+                        direction = 1 if spin_dir > 0 else -1
+                        cmd = float(cmd) + direction * step
+                        if cmd > SPIN_POS_CLAMP:
+                            cmd = SPIN_POS_CLAMP
+                            direction = -1
+                        elif cmd < -SPIN_POS_CLAMP:
+                            cmd = -SPIN_POS_CLAMP
+                            direction = 1
+                        vel_ff = direction * max_speed
+                        _send_mit(motor, cmd, vel_ff, kp, kd)
+                        with _lock:
+                            if mid in _tracks:
+                                _tracks[mid]["cmd_pos"] = cmd
+                                _tracks[mid]["target_pos"] = cmd
+                                _tracks[mid]["spin_disp"] = cmd
+                                _tracks[mid]["spin_dir"] = direction
+                                _tracks[mid]["fail"] = 0
+                    else:
+                        err = target - cmd
+                        step = max_speed * dt
+                        if abs(err) <= step:
+                            cmd = target
+                            vel_ff = 0.0
+                        else:
+                            cmd += math.copysign(step, err)
+                            vel_ff = math.copysign(max_speed, err)
+                        _send_mit(motor, cmd, vel_ff, kp, kd)
+                        with _lock:
+                            if mid in _tracks:
+                                _tracks[mid]["cmd_pos"] = cmd
+                                _tracks[mid]["fail"] = 0
                     _send_fail = 0
                 except Exception as exc:
                     with _lock:
@@ -354,9 +416,12 @@ def _control_loop() -> None:
                         with _lock:
                             if mid in _tracks:
                                 _tracks[mid]["enabled"] = False
+                                _tracks[mid]["spin_dir"] = 0
                                 _tracks[mid]["fail"] = 0
                             _sync_focus_aliases()
                         _note_error(f"馬達 0x{mid:02X} 連續送指令失敗，已自動 Disable。")
+                if i + 1 < len(jobs):
+                    time.sleep(0.002)
         elapsed = time.perf_counter() - t0
         time.sleep(max(0.0, dt - elapsed))
 
@@ -536,6 +601,7 @@ def disconnect():
         enabled_ids = [mid for mid, tr in _tracks.items() if tr.get("enabled")]
         for mid in enabled_ids:
             _tracks[mid]["enabled"] = False
+            _tracks[mid]["spin_dir"] = 0
         _sync_focus_aliases()
         if controller is not None:
             for mid in enabled_ids:
@@ -616,6 +682,8 @@ def _enable_group(motors, kp: float, kd: float) -> dict[int, float]:
                 _tracks[motor.motor_id]["cmd_pos"] = pos
                 _tracks[motor.motor_id]["target_pos"] = pos
                 _tracks[motor.motor_id]["enabled"] = True
+                _tracks[motor.motor_id]["spin_dir"] = 0
+                _tracks[motor.motor_id]["spin_disp"] = None
                 _tracks[motor.motor_id]["fail"] = 0
     return holds
 
@@ -660,6 +728,7 @@ def disable():
         ids = [mid for mid in _parse_ids(data) if mid in _tracks]
         for mid in ids:
             _tracks[mid]["enabled"] = False
+            _tracks[mid]["spin_dir"] = 0
         _sync_focus_aliases()
     if controller is not None:
         for mid in ids:
@@ -694,6 +763,8 @@ def set_target():
             return jsonify({"success": False, "error": "需要 deg 或 rad"}), 400
         any_enabled = False
         for mid in ids:
+            _tracks[mid]["spin_dir"] = 0
+            _tracks[mid]["spin_disp"] = None
             motor = _controller.get_motor(mid)
             current = _state_pos(motor)
             if current is None:
@@ -735,6 +806,82 @@ def settings():
         return jsonify({"success": True, "state": _state_payload()})
 
 
+@app.route("/api/spin", methods=["POST"])
+def spin():
+    data = request.get_json(silent=True) or {}
+    want = bool(data.get("enable"))
+    try:
+        direction = int(data.get("dir", 1))
+    except (TypeError, ValueError):
+        direction = 1
+    direction = 1 if direction >= 0 else -1
+    with _lock:
+        controller = _controller
+        kd = _kd
+        kp = _kp
+        if controller is None:
+            return jsonify({"success": False, "error": "尚未連線"}), 400
+        ready = [mid for mid, tr in _tracks.items() if tr.get("enabled")]
+        spinning = [mid for mid, tr in _tracks.items() if tr.get("spin_dir")]
+        if want:
+            if not ready:
+                return jsonify({"success": False, "error": "請先 Enable 要壓測的馬達，再開始轉圈"}), 400
+            for mid in ready:
+                if _tracks[mid].get("spin_disp") is None:
+                    seed = _tracks[mid].get("cmd_pos")
+                    _tracks[mid]["spin_disp"] = 0.0 if seed is None else float(seed)
+                _tracks[mid]["spin_dir"] = direction
+            _sync_focus_aliases()
+            payload = _state_payload()
+            ids_txt = ", ".join(f"0x{i:02X}" for i in ready)
+            msg = (
+                "持續轉圈壓測已開始（"
+                + ("順時針" if direction > 0 else "逆時針")
+                + f"，{len(ready)} 顆：{ids_txt}）。"
+            )
+        else:
+            stopped = list(spinning)
+            _clear_spin_locked(stopped)
+            _sync_focus_aliases()
+            payload = None
+            msg = None
+    if want:
+        _ensure_loop()
+        return jsonify({"success": True, "state": payload, "message": msg, "spinning_ids": ready})
+    holds: dict[int, float] = {}
+    for mid in stopped:
+        try:
+            motor = controller.get_motor(mid)
+        except KeyError:
+            continue
+        pos = _state_pos(motor)
+        if pos is None:
+            with _lock:
+                pos = _tracks.get(mid, {}).get("cmd_pos")
+        if pos is None:
+            continue
+        pos = _clamp_mit_pos(float(pos))
+        holds[mid] = pos
+        try:
+            _send_mit(motor, pos, 0.0, kp, kd)
+        except Exception as exc:
+            _note_error(f"停止轉圈後鎖定 0x{mid:02X} 失敗：{exc}")
+    with _lock:
+        for mid, pos in holds.items():
+            if mid in _tracks:
+                _tracks[mid]["cmd_pos"] = pos
+                _tracks[mid]["target_pos"] = pos
+                _tracks[mid]["spin_disp"] = None
+        _sync_focus_aliases()
+        return jsonify(
+            {
+                "success": True,
+                "state": _state_payload(),
+                "message": f"已停止轉圈，鎖在當下角度（{len(holds)} 顆）。",
+            }
+        )
+
+
 @app.route("/api/state")
 def state():
     with _lock:
@@ -751,6 +898,7 @@ def scan_bus():
         enabled_ids = [mid for mid, tr in _tracks.items() if tr.get("enabled")]
         for mid in enabled_ids:
             _tracks[mid]["enabled"] = False
+            _tracks[mid]["spin_dir"] = 0
         _sync_focus_aliases()
     if controller is None:
         return jsonify({"success": False, "error": "尚未連線"}), 400
@@ -796,6 +944,7 @@ def flash_id():
     with _lock:
         for tr in _tracks.values():
             tr["enabled"] = False
+            tr["spin_dir"] = 0
         _sync_focus_aliases()
         motor = _motor
         controller = _controller
