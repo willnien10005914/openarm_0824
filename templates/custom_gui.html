@@ -113,9 +113,32 @@
     }
     .log .err { color: var(--danger); }
     .log .ok { color: var(--ok); background: transparent; font-weight: 400; padding: 0; }
-    @media (max-width: 900px) {
-      main { grid-template-columns: 1fr; }
+    .motor-list {
+      background: #10141e;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px;
+      margin-bottom: 12px;
+      max-height: 220px;
+      overflow: auto;
     }
+    .motor-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      margin-bottom: 4px;
+      cursor: pointer;
+      border: 1px solid transparent;
+    }
+    .motor-item:last-child { margin-bottom: 0; }
+    .motor-item:hover { background: #1a2130; }
+    .motor-item.focused { border-color: #f3b14e; background: #241c0c; }
+    .motor-item.enabled { box-shadow: inset 3px 0 0 var(--ok); }
+    .motor-item input { width: auto; margin: 0; }
+    .motor-item .meta { flex: 1; font-size: 13px; }
+    .motor-item .ang { color: var(--current); font-variant-numeric: tabular-nums; font-size: 13px; }
   </style>
 </head>
 <body>
@@ -141,11 +164,15 @@
         <button class="ghost" id="btnScan">掃描 Node ID</button>
         <button class="ghost" id="btnDisconnect">斷線</button>
       </div>
-      <label>bus 上的馬達 Node ID</label>
-      <select id="motor"></select>
+      <label>bus 上的馬達（可複選，一起 Enable / 一起轉角度）</label>
+      <div class="row" style="margin-bottom: 8px">
+        <button class="ghost" id="btnSelectAll">全選</button>
+        <button class="ghost" id="btnSelectNone">全不選</button>
+      </div>
+      <div id="motorList" class="motor-list"><div class="sub" style="padding:8px">尚未掃描</div></div>
       <div class="row">
-        <button class="ok" id="btnEnable">Enable</button>
-        <button class="danger" id="btnDisable">Disable</button>
+        <button class="ok" id="btnEnable">Enable 選取</button>
+        <button class="danger" id="btnDisable">Disable 選取</button>
       </div>
       <div style="margin-top: 16px; margin-bottom: 16px; padding: 12px; background: #23293b; border: 1px solid #3d4a66; border-radius: 8px;">
         <label style="color: #f3b14e; font-weight: bold; margin-bottom: 8px; display: block;">ID 燒錄與測試 (Flash & Test)</label>
@@ -205,7 +232,7 @@
         <span><i class="dot" style="background:#5ee0c8"></i>目前位置</span>
         <span><i class="dot" style="background:#f3b14e"></i>滑鼠目標</span>
       </div>
-      <div class="hint">0° 在正上方，順時針增加。點選後走最短路徑，不會一次轉整圈。</div>
+      <div class="hint">0° 在正上方，順時針增加。點選後，<b>勾選的馬達</b>各自走最短路徑轉到該角度。</div>
       <div class="row" style="margin-top:12px">
         <button class="ghost" data-deg="0">0°</button>
         <button class="ghost" data-deg="90">90°</button>
@@ -252,6 +279,84 @@
     let lastMotorsKey = "";
     let pollFails = 0;
     let enabled = false;
+    let selectedIds = [];
+
+    function hexId(id) {
+      return "0x" + Number(id).toString(16).toUpperCase().padStart(2, "0");
+    }
+
+    function currentSelected() {
+      return Array.from(document.querySelectorAll("#motorList input[type=checkbox]:checked"))
+        .map(el => Number(el.value));
+    }
+
+    async function pushSelection(ids, focus) {
+      selectedIds = ids;
+      const body = { ids };
+      if (focus != null) body.focus = focus;
+      const data = await api("/api/select", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body)
+      });
+      applyState(data.state);
+      return data;
+    }
+
+    function renderMotorList(s) {
+      const motors = s.motors || [];
+      const key = motors.map(m => `${m.id}:${m.mst_id || ""}`).join(",");
+      const list = $("motorList");
+      if (key !== lastMotorsKey) {
+        lastMotorsKey = key;
+        if (!motors.length) {
+          list.innerHTML = `<div class="sub" style="padding:8px">沒有掃到 Node ID</div>`;
+        } else {
+          list.innerHTML = motors.map(m => {
+            const mst = m.mst_id != null ? ` MST ${hexId(m.mst_id)}` : "";
+            const checked = m.selected ? "checked" : "";
+            const en = m.enabled ? "enabled" : "";
+            const fo = m.focused ? "focused" : "";
+            const ang = m.pos_deg_mod == null ? "--" : m.pos_deg_mod.toFixed(1) + "°";
+            return `<label class="motor-item ${en} ${fo}" data-id="${m.id}">
+              <input type="checkbox" value="${m.id}" ${checked} />
+              <span class="meta">${hexId(m.id)}${mst} · ${m.status || ""} ${m.enabled ? "Enable" : ""}</span>
+              <span class="ang" data-ang="${m.id}">${ang}</span>
+            </label>`;
+          }).join("");
+          list.querySelectorAll("input[type=checkbox]").forEach(box => {
+            box.addEventListener("change", () => {
+              pushSelection(currentSelected(), s.motor_id).catch(err => log(err.message, "err"));
+            });
+          });
+          list.querySelectorAll(".motor-item").forEach(row => {
+            row.addEventListener("click", (ev) => {
+              if (ev.target.tagName === "INPUT") return;
+              const id = Number(row.dataset.id);
+              const ids = currentSelected();
+              if (!ids.includes(id)) ids.push(id);
+              pushSelection(ids, id).then(() => log(`圓盤顯示 ${hexId(id)}`)).catch(err => log(err.message, "err"));
+            });
+          });
+        }
+      } else {
+        motors.forEach(m => {
+          const row = list.querySelector(`.motor-item[data-id="${m.id}"]`);
+          if (!row) return;
+          row.classList.toggle("focused", !!m.focused);
+          row.classList.toggle("enabled", !!m.enabled);
+          const box = row.querySelector("input");
+          if (box && box.checked !== !!m.selected) box.checked = !!m.selected;
+          const ang = row.querySelector(".ang");
+          if (ang) ang.textContent = m.pos_deg_mod == null ? "--" : m.pos_deg_mod.toFixed(1) + "°";
+          const meta = row.querySelector(".meta");
+          if (meta) {
+            const mst = m.mst_id != null ? ` MST ${hexId(m.mst_id)}` : "";
+            meta.textContent = `${hexId(m.id)}${mst} · ${m.status || ""} ${m.enabled ? "Enable" : ""}`;
+          }
+        });
+      }
+    }
 
     async function api(path, opts) {
       let res;
@@ -293,8 +398,11 @@
 
     function applyState(s) {
       enabled = !!s.enabled;
+      selectedIds = (s.selected_ids || []).map(Number);
+      const nSel = selectedIds.length;
+      const nEn = (s.enabled_ids || []).length;
       $("connLabel").textContent = s.connected
-        ? `已連線 ${s.channel} (${s.adapter || "slcan"}) · Node 0x${Number(s.motor_id).toString(16).toUpperCase()} · ${s.enabled ? "Enable" : "Disable"}`
+        ? `已連線 ${s.channel} (${s.adapter || "slcan"}) · 選 ${nSel} 顆 · Enable ${nEn}`
         : "未連線";
       $("status").textContent = s.status || "--";
       $("curDeg").textContent = s.pos_deg_mod == null ? "--" : s.pos_deg_mod.toFixed(1) + "°";
@@ -303,20 +411,12 @@
       $("vel").textContent = s.vel == null ? "--" : (s.vel * 180 / Math.PI).toFixed(1) + " °/s";
       $("misc").textContent = `${(s.torq ?? 0).toFixed(2)} Nm / ${s.t_mos ?? "--"}°C`;
       $("centerDeg").textContent = s.pos_deg_mod == null ? "--°" : s.pos_deg_mod.toFixed(1) + "°";
-      $("centerHint").textContent = s.enabled ? "點圓盤選角度" : "先按 Enable 才會轉動";
+      $("centerHint").textContent = nEn
+        ? `點圓盤：${nSel || nEn} 顆一起轉到該角度`
+        : "勾選馬達後按 Enable，再點圓盤";
       if (s.pos_deg_mod != null) rotateNeedle("currentNeedle", s.pos_deg_mod);
       if (s.target_deg_mod != null) rotateNeedle("targetNeedle", s.target_deg_mod);
-      const key = (s.motors || []).map(m => `${m.id}:${m.mst_id || ""}:${m.status || ""}`).join(",");
-      if (s.motors && key !== lastMotorsKey) {
-        lastMotorsKey = key;
-        const sel = $("motor");
-        sel.innerHTML = s.motors.map(m => {
-          const node = "0x" + Number(m.id).toString(16).toUpperCase().padStart(2, "0");
-          const mst = m.mst_id != null ? " MST 0x" + Number(m.mst_id).toString(16).toUpperCase().padStart(2, "0") : "";
-          return `<option value="${m.id}">${node}${mst} · ${m.status || ""}</option>`;
-        }).join("") || `<option value="">(沒有掃到 Node ID)</option>`;
-        if (s.motor_id != null) sel.value = String(s.motor_id);
-      }
+      renderMotorList(s);
       ingestErrors(s);
     }
 
@@ -369,11 +469,14 @@
         const data = await api("/api/target", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ deg })
+          body: JSON.stringify({ deg, ids: currentSelected() })
         });
         applyState(data.state);
         if (data.warning) log(data.warning);
-        else log(`目標 ${deg.toFixed(1)}°，沿最短路徑慢速移動。`, "ok");
+        else {
+          const n = currentSelected().length || 1;
+          log(`目標 ${deg.toFixed(1)}°，${n} 顆馬達各自沿最短路徑慢速移動。`, "ok");
+        }
       });
     }
 
@@ -418,7 +521,7 @@
         const mst = m.mst_id != null ? "/MST 0x" + Number(m.mst_id).toString(16).toUpperCase().padStart(2, "0") : "";
         return node + mst;
       }).join(", ");
-      log(`已連線，掃到 ${motors.length} 顆 Node ID：${ids || "(無)"}。Enable 會停在目前角度，不會衝到 0。`, "ok");
+      log(`已連線，掃到 ${motors.length} 顆 Node ID：${ids || "(無)"}。可勾選多顆後按 Enable 選取，再點圓盤一起轉到同一角度。`, "ok");
       if (motors.length === 1) {
         log("若實際接了兩顆馬達，通常是兩顆都還是 0x01。請先單顆接上寫入不同 Sender CAN ID，再並聯掃描。");
       }
@@ -440,17 +543,35 @@
     }).catch(e => log(e.message, "err"));
 
     $("btnEnable").onclick = () => withBusy($("btnEnable"), async () => {
-      const data = await api("/api/enable", { method: "POST" });
+      const ids = currentSelected();
+      const data = await api("/api/enable", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ ids })
+      });
       applyState(data.state);
-      const hold = data.hold_rad != null ? `目前 ${Number(data.hold_rad).toFixed(3)} rad` : "目前角度";
-      log(`已 Enable，目標鎖在 ${hold}，不會衝位置。現在可以點圓盤慢速移動。`, "ok");
+      const n = (data.enabled_ids || ids).length;
+      log(`已 Enable ${n} 顆，各鎖在目前角度，不會衝位置。點圓盤會一起轉到同一角度。`, "ok");
     }).catch(e => log(e.message, "err"));
 
     $("btnDisable").onclick = () => withBusy($("btnDisable"), async () => {
-      const data = await api("/api/disable", { method: "POST" });
+      const ids = currentSelected();
+      const data = await api("/api/disable", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ ids })
+      });
       applyState(data.state);
-      log("已 Disable。", "ok");
+      log(`已 Disable ${ids.length || "選取"} 顆。`, "ok");
     }).catch(e => log(e.message, "err"));
+
+    $("btnSelectAll").onclick = () => {
+      const ids = Array.from(document.querySelectorAll("#motorList input[type=checkbox]")).map(el => Number(el.value));
+      pushSelection(ids).catch(e => log(e.message, "err"));
+    };
+    $("btnSelectNone").onclick = () => {
+      pushSelection([]).catch(e => log(e.message, "err"));
+    };
 
     $("flashJoint").onchange = () => {
       const opt = $("flashJoint").options[$("flashJoint").selectedIndex];
@@ -491,17 +612,6 @@
     }).catch(e => log(e.message, "err"));
 
 
-    $("motor").onchange = async () => {
-      try {
-        const data = await api("/api/select", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({ id: Number($("motor").value) })
-        });
-        applyState(data.state);
-        log("已切換馬達。切換後需再按 Enable。");
-      } catch (e) { log(e.message, "err"); }
-    };
     async function pushSettings() {
       $("speedLabel").textContent = $("speed").value + " °/s";
       try {
@@ -521,7 +631,7 @@
     $("kd").onchange = pushSettings;
 
     refreshPorts().catch(err => log(err.message, "err"));
-    log("選轉接器與 COM 埠後按連線。Enable 後在右側圓盤點選目標角度。");
+    log("選轉接器與 COM 埠後按連線。勾選多顆可一起 Enable，再點圓盤一起轉到同一角度。");
     setInterval(poll, 200);
   </script>
 </body>

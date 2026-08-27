@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import threading
@@ -33,6 +34,9 @@ _lock = threading.RLock()
 _controller = None
 _motor = None
 _motors_found: list[dict[str, Any]] = []
+_tracks: dict[int, dict[str, Any]] = {}
+_selected_ids: list[int] = []
+_focus_id: Optional[int] = None
 _enabled = False
 _cmd_pos: Optional[float] = None
 _target_pos: Optional[float] = None
@@ -58,30 +62,147 @@ def _note_error(msg: str) -> None:
         del _errors[:-20]
 
 
+def _deg_mod(pos: Optional[float]) -> Optional[float]:
+    if pos is None:
+        return None
+    return (math.degrees(pos) % 360.0 + 360.0) % 360.0
+
+
+def _sync_focus_aliases() -> None:
+    global _motor, _enabled, _cmd_pos, _target_pos
+    if _controller is None or _focus_id is None or _focus_id not in _tracks:
+        _motor = None
+        _enabled = False
+        _cmd_pos = None
+        _target_pos = None
+        return
+    try:
+        _motor = _controller.get_motor(_focus_id)
+    except KeyError:
+        _motor = None
+    tr = _tracks.get(_focus_id, {})
+    _cmd_pos = tr.get("cmd_pos")
+    _target_pos = tr.get("target_pos")
+    _enabled = any(
+        bool(_tracks.get(mid, {}).get("enabled")) for mid in _selected_ids if mid in _tracks
+    )
+
+
+def _reset_tracks(
+    controller,
+    motors: list[dict[str, Any]],
+    keep_selected: Optional[list[int]] = None,
+    prefer_focus: Optional[int] = None,
+) -> None:
+    global _tracks, _selected_ids, _focus_id
+    found_ids = [int(item["id"]) for item in motors]
+    old = _tracks
+    _tracks = {}
+    for mid in found_ids:
+        motor = controller.get_motor(mid)
+        pos = _state_pos(motor)
+        prev = old.get(mid, {})
+        _tracks[mid] = {
+            "enabled": False,
+            "cmd_pos": pos if pos is not None else prev.get("cmd_pos"),
+            "target_pos": pos if pos is not None else prev.get("target_pos"),
+            "fail": 0,
+        }
+    if keep_selected:
+        _selected_ids = [mid for mid in keep_selected if mid in _tracks]
+    else:
+        _selected_ids = list(found_ids)
+    if not _selected_ids and found_ids:
+        _selected_ids = [found_ids[0]]
+    if prefer_focus in _tracks:
+        _focus_id = prefer_focus
+    elif _focus_id not in _tracks:
+        _focus_id = _selected_ids[0] if _selected_ids else None
+    _sync_focus_aliases()
+
+
+def _parse_ids(data: dict[str, Any]) -> list[int]:
+    raw = data.get("ids")
+    if raw is None and data.get("id") is not None:
+        raw = [data.get("id")]
+    if raw is None:
+        return list(_selected_ids)
+    ids: list[int] = []
+    seen: set[int] = set()
+    for item in raw:
+        mid = int(item)
+        if mid in seen:
+            continue
+        seen.add(mid)
+        ids.append(mid)
+    return ids
+
+
+def _motors_payload() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for info in _motors_found:
+        mid = int(info["id"])
+        motor = None
+        if _controller is not None:
+            try:
+                motor = _controller.get_motor(mid)
+            except KeyError:
+                motor = None
+        state = (motor.get_states() if motor is not None else None) or {}
+        tr = _tracks.get(mid, {})
+        pos = state.get("pos")
+        if pos is None:
+            pos = tr.get("cmd_pos")
+        tgt = tr.get("target_pos")
+        item = dict(info)
+        item.update(
+            {
+                "selected": mid in _selected_ids,
+                "enabled": bool(tr.get("enabled")),
+                "focused": mid == _focus_id,
+                "pos": pos,
+                "pos_deg_mod": _deg_mod(None if pos is None else float(pos)),
+                "target_rad": tgt,
+                "target_deg_mod": _deg_mod(None if tgt is None else float(tgt)),
+                "status": state.get("status") or info.get("status"),
+                "vel": state.get("vel"),
+                "torq": state.get("torq"),
+                "t_mos": state.get("t_mos"),
+            }
+        )
+        out.append(item)
+    return out
+
+
 def _state_payload() -> dict[str, Any]:
+    _sync_focus_aliases()
     motor = _motor
     raw = motor.get_states() if motor else {}
     pos = raw.get("pos")
+    if pos is None:
+        pos = _cmd_pos
     vel = raw.get("vel")
+    motors = _motors_payload()
+    enabled_ids = [mid for mid, tr in _tracks.items() if tr.get("enabled")]
     return {
         "connected": _controller is not None,
         "channel": _channel,
         "adapter": _adapter_kind,
         "enabled": _enabled,
-        "motor_id": None if motor is None else motor.motor_id,
-        "motors": list(_motors_found),
+        "motor_id": _focus_id,
+        "selected_ids": list(_selected_ids),
+        "enabled_ids": enabled_ids,
+        "motors": motors,
         "status": raw.get("status"),
         "pos_rad": pos,
         "pos_deg": None if pos is None else math.degrees(pos),
-        "pos_deg_mod": None if pos is None else (math.degrees(pos) % 360.0 + 360.0) % 360.0,
+        "pos_deg_mod": _deg_mod(None if pos is None else float(pos)),
         "vel": vel,
         "torq": raw.get("torq"),
         "t_mos": raw.get("t_mos"),
         "t_rotor": raw.get("t_rotor"),
         "target_rad": _target_pos,
-        "target_deg_mod": None
-        if _target_pos is None
-        else (_target_pos * 180.0 / math.pi % 360.0 + 360.0) % 360.0,
+        "target_deg_mod": _deg_mod(_target_pos),
         "cmd_rad": _cmd_pos,
         "kp": _kp,
         "kd": _kd,
@@ -185,40 +306,57 @@ def _read_register_fresh(motor, rid: int, timeout: float = 0.7) -> Optional[int]
 
 
 def _control_loop() -> None:
-    global _cmd_pos, _send_fail, _enabled
+    global _send_fail
     dt = 1.0 / CMD_HZ
     while not _loop_stop.is_set():
         t0 = time.perf_counter()
         with _lock:
-            motor = _motor
-            enabled = _enabled
-            cmd = _cmd_pos
-            target = _target_pos
+            controller = _controller
             max_speed = _max_speed_rad_s
             kp = _kp
             kd = _kd
-        if motor is not None and enabled and cmd is not None and target is not None:
-            err = target - cmd
-            step = max_speed * dt
-            if abs(err) <= step:
-                cmd = target
-                vel_ff = 0.0
-            else:
-                cmd += math.copysign(step, err)
-                vel_ff = math.copysign(max_speed, err)
-            try:
-                _send_mit(motor, cmd, vel_ff, kp, kd)
-                _send_fail = 0
-                with _lock:
-                    _cmd_pos = cmd
-            except Exception as exc:
-                _send_fail += 1
-                _note_error(f"MIT 送指令失敗（{_send_fail}）：{exc}")
-                if _send_fail >= 8:
+            jobs = []
+            for mid, tr in _tracks.items():
+                if not tr.get("enabled"):
+                    continue
+                cmd = tr.get("cmd_pos")
+                target = tr.get("target_pos")
+                if cmd is None or target is None or controller is None:
+                    continue
+                jobs.append((mid, cmd, target))
+        if jobs and controller is not None:
+            for mid, cmd, target in jobs:
+                err = target - cmd
+                step = max_speed * dt
+                if abs(err) <= step:
+                    cmd = target
+                    vel_ff = 0.0
+                else:
+                    cmd += math.copysign(step, err)
+                    vel_ff = math.copysign(max_speed, err)
+                try:
+                    motor = controller.get_motor(mid)
+                    _send_mit(motor, cmd, vel_ff, kp, kd)
                     with _lock:
-                        _enabled = False
-                    _note_error("連續送指令失敗，已自動 Disable。請檢查 COM / 重新連線。")
+                        if mid in _tracks:
+                            _tracks[mid]["cmd_pos"] = cmd
+                            _tracks[mid]["fail"] = 0
                     _send_fail = 0
+                except Exception as exc:
+                    with _lock:
+                        if mid in _tracks:
+                            _tracks[mid]["fail"] = int(_tracks[mid].get("fail") or 0) + 1
+                            fail_n = _tracks[mid]["fail"]
+                        else:
+                            fail_n = 0
+                    _note_error(f"MIT 送指令失敗（0x{mid:02X} #{fail_n}）：{exc}")
+                    if fail_n >= 8:
+                        with _lock:
+                            if mid in _tracks:
+                                _tracks[mid]["enabled"] = False
+                                _tracks[mid]["fail"] = 0
+                            _sync_focus_aliases()
+                        _note_error(f"馬達 0x{mid:02X} 連續送指令失敗，已自動 Disable。")
         elapsed = time.perf_counter() - t0
         time.sleep(max(0.0, dt - elapsed))
 
@@ -233,11 +371,15 @@ def _ensure_loop() -> None:
 
 
 def _shutdown_controller() -> None:
-    global _controller, _motor, _enabled, _cmd_pos, _target_pos, _motors_found, _channel, _adapter_kind
+    global _controller, _motor, _enabled, _cmd_pos, _target_pos, _motors_found
+    global _channel, _adapter_kind, _tracks, _selected_ids, _focus_id
     with _lock:
         _enabled = False
         _cmd_pos = None
         _target_pos = None
+        _tracks = {}
+        _selected_ids = []
+        _focus_id = None
         controller = _controller
         _controller = None
         _motor = None
@@ -372,12 +514,10 @@ def connect():
             _note_error("連線時讀不到位置，暫以 0 顯示；Enable 前會再讀一次。")
         with _lock:
             _controller = controller
-            _motor = motor
             _motors_found = motors
             _channel = channel
             _adapter_kind = kind
-            _cmd_pos = pos
-            _target_pos = pos
+            _reset_tracks(controller, motors)
             payload = _state_payload()
         _ensure_loop()
         return jsonify({"success": True, "state": payload})
@@ -390,14 +530,24 @@ def connect():
 
 @app.route("/api/disconnect", methods=["POST"])
 def disconnect():
-    motor = None
-    enabled = False
+    motors = []
     with _lock:
-        motor = _motor
-        enabled = _enabled
-        _enabled = False
-    if motor is not None and enabled:
+        controller = _controller
+        enabled_ids = [mid for mid, tr in _tracks.items() if tr.get("enabled")]
+        for mid in enabled_ids:
+            _tracks[mid]["enabled"] = False
+        _sync_focus_aliases()
+        if controller is not None:
+            for mid in enabled_ids:
+                try:
+                    motors.append(controller.get_motor(mid))
+                except KeyError:
+                    pass
+    for motor in motors:
         try:
+            pos = _state_pos(motor)
+            if pos is not None:
+                _send_mit(motor, pos, 0.0, 0.0, 0.0)
             motor.disable()
         except Exception as exc:
             _note_error(f"Disable 失敗：{exc}")
@@ -407,128 +557,164 @@ def disconnect():
 
 @app.route("/api/select", methods=["POST"])
 def select_motor():
-    global _motor, _cmd_pos, _target_pos, _enabled
+    global _selected_ids, _focus_id
     data = request.get_json(silent=True) or {}
-    motor_id = int(data.get("id", 0))
     with _lock:
         if _controller is None:
             return jsonify({"success": False, "error": "尚未連線"}), 400
-        if _motor is not None and _motor.motor_id == motor_id:
-            return jsonify({"success": True, "state": _state_payload()})
-        try:
-            motor = _controller.get_motor(motor_id)
-        except KeyError:
-            return jsonify({"success": False, "error": f"沒有馬達 {motor_id}"}), 404
-        old = _motor
-        was_enabled = _enabled
-        _enabled = False
-        _motor = motor
-    if was_enabled and old is not None:
-        try:
-            old.disable()
-        except Exception as exc:
-            _note_error(f"切換馬達時 Disable 失敗：{exc}")
-    pos = _state_pos(motor)
-    if pos is None:
-        pos = _wait_pos(motor, timeout=0.3)
-    with _lock:
-        _cmd_pos = pos
-        _target_pos = pos if pos is not None else _target_pos
+        ids = _parse_ids(data)
+        valid = [mid for mid in ids if mid in _tracks]
+        if not valid and ids:
+            return jsonify({"success": False, "error": "選擇的 Node ID 不在掃描結果裡"}), 400
+        _selected_ids = valid
+        focus = data.get("focus")
+        if focus is not None:
+            focus = int(focus)
+            if focus in _tracks:
+                _focus_id = focus
+        if _selected_ids and _focus_id not in _selected_ids:
+            _focus_id = _selected_ids[0]
+        _sync_focus_aliases()
         return jsonify({"success": True, "state": _state_payload()})
+
+
+def _enable_group(motors, kp: float, kd: float) -> dict[int, float]:
+    holds: dict[int, float] = {}
+    missing: list[int] = []
+    for motor in motors:
+        try:
+            motor.ensure_control_mode("MIT")
+        except Exception as exc:
+            _note_error(f"0x{motor.motor_id:02X} 確認 MIT 模式失敗（繼續 Enable）：{exc}")
+        pos = _wait_pos(motor, timeout=0.45)
+        if pos is None:
+            missing.append(motor.motor_id)
+            continue
+        holds[motor.motor_id] = pos
+        with _lock:
+            if motor.motor_id in _tracks:
+                _tracks[motor.motor_id]["cmd_pos"] = pos
+                _tracks[motor.motor_id]["target_pos"] = pos
+    if missing and not holds:
+        raise RuntimeError(
+            "讀不到目前位置，已取消 Enable，避免馬達衝到 0。請再按一次掃描後重試。"
+        )
+    if missing:
+        _note_error("部分馬達讀不到位置，已跳過：" + ", ".join(f"0x{i:02X}" for i in missing))
+    ready = [m for m in motors if m.motor_id in holds]
+    for motor in ready:
+        motor.enable()
+    for _ in range(6):
+        for motor in ready:
+            _send_mit(motor, holds[motor.motor_id], 0.0, kp, kd)
+        time.sleep(0.015)
+    for motor in ready:
+        pos = _wait_pos(motor, timeout=0.2) or holds[motor.motor_id]
+        holds[motor.motor_id] = pos
+        with _lock:
+            if motor.motor_id in _tracks:
+                _tracks[motor.motor_id]["cmd_pos"] = pos
+                _tracks[motor.motor_id]["target_pos"] = pos
+                _tracks[motor.motor_id]["enabled"] = True
+                _tracks[motor.motor_id]["fail"] = 0
+    return holds
 
 
 @app.route("/api/enable", methods=["POST"])
 def enable():
-    global _enabled, _cmd_pos, _target_pos
+    data = request.get_json(silent=True) or {}
     with _lock:
-        motor = _motor
+        controller = _controller
         kp = _kp
         kd = _kd
-        fallback = _cmd_pos
-        if motor is None:
+        if controller is None:
             return jsonify({"success": False, "error": "尚未連線"}), 400
-    try:
-        pos = _wait_pos(motor, timeout=0.5)
-        if pos is None:
-            pos = fallback
-        if pos is None:
-            return jsonify(
-                {
-                    "success": False,
-                    "error": "讀不到目前位置，已取消 Enable，避免馬達衝到 0。請再按一次掃描後重試。",
-                }
-            ), 400
-        with _lock:
-            _cmd_pos = pos
-            _target_pos = pos
+        ids = [mid for mid in _parse_ids(data) if mid in _tracks]
+        if not ids:
+            return jsonify({"success": False, "error": "請先勾選要 Enable 的馬達"}), 400
+    motors = []
+    for mid in ids:
         try:
-            motor.ensure_control_mode("MIT")
-        except Exception as exc:
-            _note_error(f"確認 MIT 模式失敗（改以目前模式 Enable）：{exc}")
-        pos = _wait_pos(motor, timeout=0.25) or pos
-        with _lock:
-            _cmd_pos = pos
-            _target_pos = pos
-        motor.enable()
-        _hold_at(motor, pos, kp, kd, times=8)
-        pos = _wait_pos(motor, timeout=0.25) or pos
-        _hold_at(motor, pos, kp, kd, times=4)
+            motors.append(controller.get_motor(mid))
+        except KeyError:
+            return jsonify({"success": False, "error": f"沒有馬達 0x{mid:02X}"}), 404
+    try:
+        holds = _enable_group(motors, kp, kd)
     except Exception as exc:
         _note_error(f"Enable 失敗：{exc}")
         traceback.print_exc()
         return jsonify({"success": False, "error": f"無法 Enable / 切到 MIT：{exc}"}), 500
     with _lock:
-        _cmd_pos = pos
-        _target_pos = pos
-        _enabled = True
+        _sync_focus_aliases()
         payload = _state_payload()
     _ensure_loop()
-    return jsonify({"success": True, "state": payload, "hold_rad": pos})
+    hold_rad = holds.get(_focus_id) if holds else None
+    return jsonify({"success": True, "state": payload, "hold_rad": hold_rad, "enabled_ids": list(holds)})
 
 
 @app.route("/api/disable", methods=["POST"])
 def disable():
-    global _enabled
+    data = request.get_json(silent=True) or {}
     with _lock:
-        motor = _motor
-        pos = _cmd_pos
-        _enabled = False
-    if motor is not None:
-        try:
-            hold = float((motor.get_states() or {}).get("pos") or pos or 0.0)
-            _send_mit(motor, hold, 0.0, 0.0, 0.0)
-            time.sleep(0.02)
-            motor.disable()
-        except Exception as exc:
-            _note_error(f"Disable 失敗：{exc}")
+        controller = _controller
+        ids = [mid for mid in _parse_ids(data) if mid in _tracks]
+        for mid in ids:
+            _tracks[mid]["enabled"] = False
+        _sync_focus_aliases()
+    if controller is not None:
+        for mid in ids:
+            try:
+                motor = controller.get_motor(mid)
+            except KeyError:
+                continue
+            try:
+                hold = _state_pos(motor)
+                if hold is None:
+                    hold = _tracks.get(mid, {}).get("cmd_pos")
+                if hold is not None:
+                    _send_mit(motor, float(hold), 0.0, 0.0, 0.0)
+                time.sleep(0.01)
+                motor.disable()
+            except Exception as exc:
+                _note_error(f"Disable 0x{mid:02X} 失敗：{exc}")
     with _lock:
         return jsonify({"success": True, "state": _state_payload()})
 
 
 @app.route("/api/target", methods=["POST"])
 def set_target():
-    global _target_pos, _cmd_pos
     data = request.get_json(silent=True) or {}
     with _lock:
-        if _motor is None:
+        if _controller is None:
             return jsonify({"success": False, "error": "尚未連線"}), 400
-        current = _state_pos(_motor)
-        if current is None:
-            current = float(_cmd_pos or 0.0)
-        if _cmd_pos is None:
-            _cmd_pos = current
-        if "deg" in data:
-            _target_pos = _nearest_target(current, float(data["deg"]))
-        elif "rad" in data:
-            _target_pos = float(data["rad"])
-        else:
+        ids = [mid for mid in _parse_ids(data) if mid in _tracks]
+        if not ids:
+            return jsonify({"success": False, "error": "請先勾選要轉動的馬達"}), 400
+        if "deg" not in data and "rad" not in data:
             return jsonify({"success": False, "error": "需要 deg 或 rad"}), 400
-        if not _enabled:
+        any_enabled = False
+        for mid in ids:
+            motor = _controller.get_motor(mid)
+            current = _state_pos(motor)
+            if current is None:
+                current = _tracks[mid].get("cmd_pos")
+            if current is None:
+                current = 0.0
+            if _tracks[mid].get("cmd_pos") is None:
+                _tracks[mid]["cmd_pos"] = current
+            if "deg" in data:
+                _tracks[mid]["target_pos"] = _nearest_target(float(current), float(data["deg"]))
+            else:
+                _tracks[mid]["target_pos"] = float(data["rad"])
+            if _tracks[mid].get("enabled"):
+                any_enabled = True
+        _sync_focus_aliases()
+        if not any_enabled:
             return jsonify(
                 {
                     "success": True,
                     "state": _state_payload(),
-                    "warning": "已記下目標，但馬達尚未 Enable，不會轉動。",
+                    "warning": "已記下目標，但選取的馬達尚未 Enable，不會轉動。",
                 }
             )
         return jsonify({"success": True, "state": _state_payload()})
@@ -557,28 +743,27 @@ def state():
 
 @app.route("/api/scan", methods=["POST"])
 def scan_bus():
-    global _motor, _motors_found, _cmd_pos, _target_pos, _enabled
+    global _motors_found
     with _lock:
         controller = _controller
-        motor = _motor
-        prefer_id = None if motor is None else motor.motor_id
-        _enabled = False
+        keep_selected = list(_selected_ids)
+        keep_focus = _focus_id
+        enabled_ids = [mid for mid, tr in _tracks.items() if tr.get("enabled")]
+        for mid in enabled_ids:
+            _tracks[mid]["enabled"] = False
+        _sync_focus_aliases()
     if controller is None:
         return jsonify({"success": False, "error": "尚未連線"}), 400
-    if motor is not None:
+    for mid in enabled_ids:
         try:
-            motor.disable()
+            controller.get_motor(mid).disable()
         except Exception as exc:
-            _note_error(f"掃描前 Disable 失敗：{exc}")
+            _note_error(f"掃描前 Disable 0x{mid:02X} 失敗：{exc}")
     try:
         motors = _scan(controller, MOTOR_TYPE)
-        motor, pos = _select_scanned_motor(controller, motors, prefer_id)
         with _lock:
             _motors_found = motors
-            _motor = motor
-            if pos is not None:
-                _cmd_pos = pos
-                _target_pos = pos
+            _reset_tracks(controller, motors, keep_selected, prefer_focus=keep_focus)
             payload = _state_payload()
         ids = ", ".join(
             f"0x{item['id']:02X}(MST 0x{int(item.get('mst_id') or 0):02X})" for item in motors
@@ -609,11 +794,13 @@ def flash_id():
         return jsonify({"success": False, "error": "Receiver / Master ID 必須是 0–0x7FF"}), 400
 
     with _lock:
+        for tr in _tracks.values():
+            tr["enabled"] = False
+        _sync_focus_aliases()
         motor = _motor
         controller = _controller
-        _enabled = False
         if motor is None or controller is None:
-            return jsonify({"success": False, "error": "尚未連線"}), 400
+            return jsonify({"success": False, "error": "尚未連線，或請先點選要燒錄的那顆馬達"}), 400
 
     try:
         old_id = motor.motor_id
@@ -668,11 +855,9 @@ def flash_id():
             pos = _wait_pos(motor, timeout=0.3) if motor is not None else None
 
         with _lock:
-            _motor = motor
             _motors_found = motors
-            if pos is not None:
-                _cmd_pos = pos
-                _target_pos = pos
+            keep = [sender_can_id] if sender_can_id in {item["id"] for item in motors} else None
+            _reset_tracks(controller, motors, keep, prefer_focus=sender_can_id)
             payload = _state_payload()
 
         persisted = esc == sender_can_id
@@ -714,8 +899,19 @@ def _unhandled(exc):
     return jsonify({"success": False, "error": str(exc)}), 500
 
 
+def _quiet_access_log() -> None:
+    class _SkipPoll(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            return "/api/state" not in msg
+
+    werkzeug = logging.getLogger("werkzeug")
+    werkzeug.addFilter(_SkipPoll())
+
+
 def run_server(host: str = "127.0.0.1", port: int = 5000) -> None:
     patch_damiao.apply()
+    _quiet_access_log()
     ports = list_adapter_ports()
     print("自訂 DaMiao GUI（Zubax Babel slcan / USB-CAN-A）")
     print("Open http://{}:{}".format(host, port))
