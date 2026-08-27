@@ -138,9 +138,10 @@
       <select id="port"></select>
       <div class="row">
         <button class="primary" id="btnConnect">連線並掃描</button>
+        <button class="ghost" id="btnScan">掃描 Node ID</button>
         <button class="ghost" id="btnDisconnect">斷線</button>
       </div>
-      <label>馬達 Node ID</label>
+      <label>bus 上的馬達 Node ID</label>
       <select id="motor"></select>
       <div class="row">
         <button class="ok" id="btnEnable">Enable</button>
@@ -185,8 +186,8 @@
       <div class="sub" id="speedLabel">18 °/s</div>
       <label>MIT Kp / Kd</label>
       <div class="row">
-        <input id="kp" type="number" step="0.5" value="8" />
-        <input id="kd" type="number" step="0.1" value="1.0" />
+        <input id="kp" type="number" step="0.5" value="4" />
+        <input id="kd" type="number" step="0.1" value="2.0" />
       </div>
       <div class="log" id="log">選轉接器與 COM 埠後按連線。Enable 後在右側圓盤點選目標角度。</div>
     </section>
@@ -305,13 +306,15 @@
       $("centerHint").textContent = s.enabled ? "點圓盤選角度" : "先按 Enable 才會轉動";
       if (s.pos_deg_mod != null) rotateNeedle("currentNeedle", s.pos_deg_mod);
       if (s.target_deg_mod != null) rotateNeedle("targetNeedle", s.target_deg_mod);
-      const key = (s.motors || []).map(m => m.id).join(",");
+      const key = (s.motors || []).map(m => `${m.id}:${m.mst_id || ""}:${m.status || ""}`).join(",");
       if (s.motors && key !== lastMotorsKey) {
         lastMotorsKey = key;
         const sel = $("motor");
-        sel.innerHTML = s.motors.map(m =>
-          `<option value="${m.id}">0x${m.id.toString(16).toUpperCase().padStart(2,"0")} · ${m.status || ""}</option>`
-        ).join("");
+        sel.innerHTML = s.motors.map(m => {
+          const node = "0x" + Number(m.id).toString(16).toUpperCase().padStart(2, "0");
+          const mst = m.mst_id != null ? " MST 0x" + Number(m.mst_id).toString(16).toUpperCase().padStart(2, "0") : "";
+          return `<option value="${m.id}">${node}${mst} · ${m.status || ""}</option>`;
+        }).join("") || `<option value="">(沒有掃到 Node ID)</option>`;
         if (s.motor_id != null) sel.value = String(s.motor_id);
       }
       ingestErrors(s);
@@ -409,7 +412,24 @@
         body: JSON.stringify({ channel: $("port").value, adapter: $("adapter").value })
       });
       applyState(data.state);
-      log("已連線並掃到馬達。請先 Enable，再點圓盤選位置。", "ok");
+      const motors = (data.state && data.state.motors) || [];
+      const ids = motors.map(m => {
+        const node = "0x" + Number(m.id).toString(16).toUpperCase().padStart(2, "0");
+        const mst = m.mst_id != null ? "/MST 0x" + Number(m.mst_id).toString(16).toUpperCase().padStart(2, "0") : "";
+        return node + mst;
+      }).join(", ");
+      log(`已連線，掃到 ${motors.length} 顆 Node ID：${ids || "(無)"}。Enable 會停在目前角度，不會衝到 0。`, "ok");
+      if (motors.length === 1) {
+        log("若實際接了兩顆馬達，通常是兩顆都還是 0x01。請先單顆接上寫入不同 Sender CAN ID，再並聯掃描。");
+      }
+    }).catch(e => log(e.message, "err"));
+
+    $("btnScan").onclick = () => withBusy($("btnScan"), async () => {
+      log("正在掃描 bus 上的馬達 Node ID...");
+      const data = await api("/api/scan", { method: "POST" });
+      lastMotorsKey = "";
+      applyState(data.state);
+      log(data.message || "掃描完成。", "ok");
     }).catch(e => log(e.message, "err"));
 
     $("btnDisconnect").onclick = () => withBusy($("btnDisconnect"), async () => {
@@ -422,7 +442,8 @@
     $("btnEnable").onclick = () => withBusy($("btnEnable"), async () => {
       const data = await api("/api/enable", { method: "POST" });
       applyState(data.state);
-      log("已 Enable。現在可以點圓盤，馬達會慢慢轉到該角度。", "ok");
+      const hold = data.hold_rad != null ? `目前 ${Number(data.hold_rad).toFixed(3)} rad` : "目前角度";
+      log(`已 Enable，目標鎖在 ${hold}，不會衝位置。現在可以點圓盤慢速移動。`, "ok");
     }).catch(e => log(e.message, "err"));
 
     $("btnDisable").onclick = () => withBusy($("btnDisable"), async () => {

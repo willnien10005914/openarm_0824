@@ -3,7 +3,7 @@
 Safety defaults:
   - amplitude 0.20 rad (~11 deg)
   - frequency 0.08 Hz
-  - stiffness 4.0, damping 0.8
+  - stiffness 4.0, damping 2.0
   - command rate 50 Hz
 
 Usage:
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amplitude", type=float, default=0.20, help="MIT position amplitude in rad")
     parser.add_argument("--freq", type=float, default=0.08, help="Sine frequency in Hz (keep low)")
     parser.add_argument("--kp", type=float, default=4.0, help="MIT stiffness")
-    parser.add_argument("--kd", type=float, default=0.8, help="MIT damping")
+    parser.add_argument("--kd", type=float, default=2.0, help="MIT damping")
     parser.add_argument("--rate", type=float, default=50.0, help="Command frequency in Hz")
     parser.add_argument("--scan-end", type=lambda x: int(x, 0), default=0x10)
     return parser.parse_args()
@@ -78,25 +78,24 @@ def scan_motors(controller, motor_type: str, end_id: int) -> list[int]:
             )
         except ValueError:
             motor = controller.get_motor(motor_id)
-        motor.send_cmd_mit(
-            target_position=0.0,
-            target_velocity=0.0,
-            stiffness=0.0,
-            damping=0.0,
-            feedforward_torque=0.0,
-        )
-        time.sleep(0.02)
-
-    deadline = time.perf_counter() + 0.6
-    responded: set[int] = set()
-    while time.perf_counter() < deadline:
-        controller.poll_feedback()
-        for motor_id, motor in controller.motors.items():
+        motor.state = {}
+        try:
+            motor.request_motor_feedback()
+        except Exception:
+            motor.send_raw(motor.encode_cmd_msg(0.0, 0.0, 0.0, 0.0, 0.0))
+        deadline = time.perf_counter() + 0.12
+        while time.perf_counter() < deadline:
+            time.sleep(0.015)
             state = motor.get_states() or {}
-            if state.get("can_id") is not None and motor_id not in responded:
-                responded.add(motor_id)
+            if state.get("can_id") is not None:
                 found.append(motor_id)
-        time.sleep(0.01)
+                break
+
+    found_set = set(found)
+    for motor_id in list(controller.motors):
+        if motor_id not in found_set:
+            controller.motors.pop(motor_id, None)
+            controller._motors_by_feedback.pop(motor_id, None)
     return found
 
 
@@ -190,21 +189,28 @@ def main() -> None:
 
         motor = controller.get_motor(found[0])
         print(f"Controlling motor 0x{motor.motor_id:02X} in MIT mode (slow).")
-        motor.enable()
-        time.sleep(0.05)
-        motor.ensure_control_mode("MIT")
-        time.sleep(0.05)
-
-        # Wait for a valid position sample before moving.
-        origin = 0.0
-        for _ in range(20):
+        origin = None
+        for _ in range(25):
             state = motor.get_states() or {}
             if state.get("pos") is not None:
                 origin = float(state["pos"])
                 break
-            motor.send_cmd_mit(origin, 0.0, args.kp, args.kd, 0.0)
+            try:
+                motor.request_motor_feedback()
+            except Exception:
+                pass
             time.sleep(0.02)
-        print(f"Current position origin = {origin:.4f} rad")
+        if origin is None:
+            raise SystemExit("Could not read current position; refusing to enable (would jump to 0).")
+        try:
+            motor.ensure_control_mode("MIT")
+        except Exception as exc:
+            print(f"Warning: could not confirm MIT mode: {exc}")
+        motor.enable()
+        for _ in range(8):
+            motor.send_raw(motor.encode_cmd_msg(origin, 0.0, 0.0, args.kp, args.kd))
+            time.sleep(0.015)
+        print(f"Enabled at current position origin = {origin:.4f} rad")
 
         period = 1.0 / max(args.rate, 1.0)
         start = time.perf_counter()
